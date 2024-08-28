@@ -9,27 +9,22 @@ import time
 import matplotlib.pyplot as plt
 
 from my_yolo_model import YOLO
-from config import DEVICE, NUM_EPOCHS, PATH, NUM_CLASSES, NUMBER_BLOCKS_LIST, BACKBONE_NUM_CHANNELS
+from config import (DEVICE,
+                    NUM_EPOCHS,
+                    PATH, 
+                    NUM_CLASSES, 
+                    NUMBER_BLOCKS_LIST, 
+                    BACKBONE_NUM_CHANNELS, 
+                    LOAD_MODEL, 
+                    CHECKPOINT_FILE,
+                    LEARNING_RATE)
 from loss import YoloLoss
-from utils import get_data_loaders, save_checkpoint, load_checkpoint
+from utils import get_data_loaders, save_checkpoint, load_checkpoint, mean_average_precision
 
 
 
-print(100 * "-", '\n', "Инициализация модели \n", 100 * "-")
-model = YOLO(num_classes=NUM_CLASSES, n_blocks_list=NUMBER_BLOCKS_LIST, backbone_num_channels=BACKBONE_NUM_CHANNELS)
-optimizer = Adam(model.parameters(), lr=1e-3)
-scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
 
-# Работа с несколькими cuda
-if torch.cuda.is_available():
-    if torch.cuda.device_count() > 1:
-        print(f'Имеется {torch.cuda.device_count()} GPU') 
-        model = nn.DataParallel(model)
 
-#set the type of tesor as TF32
-torch.set_float32_matmul_precision('high')
-
-model.to(DEVICE)
 
 def train(model: nn.Module,
          loader: DataLoader,
@@ -133,6 +128,9 @@ def whole_train_valid_cycle(model: nn.Module,
                     metric,
                     metric_name: str,
                     title: str,
+                    scheduler,
+                    optimizer,
+                    model_epoch: int = 0,
                     ):
     '''Ф-я проводит для каждой эпох обучение на трейновой выборке, валидацию для валидной выборки
     и отрисовку графиков. '''
@@ -147,10 +145,12 @@ def whole_train_valid_cycle(model: nn.Module,
         train_loss = train(model=model, loader=train_loader, loss_fn=loss_fn, metric=metric, device=DEVICE, optimizer=optimizer)
         train_loss_history.append(train_loss) 
         # train_metric_history.append(train_metric) 
-
+        
+        model_epoch += 1
         if epoch % 5 ==0:
             valid_loss = valid(model, valid_loader, loss_fn, metric)
-            save_checkpoint(model=model, optimizer=optimizer, filename=f"{title}_{epoch}.tar")
+            save_checkpoint(model=model, optimizer=optimizer, model_epoch=model_epoch, filename=f"models\\{title}_{epoch}.tar")
+            
 
         valid_loss_history.append(valid_loss) 
         # valid_metric_history.append(valid_metric)
@@ -159,7 +159,7 @@ def whole_train_valid_cycle(model: nn.Module,
 
         t1 = time.time()
         dt = (t1 - t0) #time difference in seconds
-        print(f"step {epoch} | Valid Loss: {valid_loss:.4f} | Valid {metric_name}: {valid_metric:.4f} | dt: {dt:.5}s")
+        print(f"step {epoch} |  Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f} | Valid {metric_name}: {valid_metric:.4f} | dt: {dt:.5}s")
                
         # print(f"step {epoch} | loss: {loss_accum.item():.6f} | lr: {lr: .4e} | norm: {norm: .4f} | dt: {dt:.5}s | tok/sec: {tokens_per_sec}")
         
@@ -169,20 +169,49 @@ def whole_train_valid_cycle(model: nn.Module,
         
 
 def main():
+    print(100 * "-", '\n', "Инициализация модели \n", 100 * "-")
+    model = YOLO(num_classes=NUM_CLASSES, n_blocks_list=NUMBER_BLOCKS_LIST, backbone_num_channels=BACKBONE_NUM_CHANNELS)
+    optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = StepLR(optimizer, step_size=20, gamma=0.1)
+    loss_fn = YoloLoss(num_classes=NUM_CLASSES)
 
-    from utils import mean_average_precision
+    # Работа с несколькими cuda
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() > 1:
+            print(f'Имеется {torch.cuda.device_count()} GPU') 
+            model = nn.DataParallel(model)
+
+    #set the type of tesor as TF32
+    torch.set_float32_matmul_precision('high')
+    model_epoch = 0
+
+    # Загрузка предобученной модели
+    if LOAD_MODEL:
+        try:
+            model_epoch_list = []
+            load_checkpoint(
+                CHECKPOINT_FILE, model, optimizer, LEARNING_RATE, model_epoch_list
+            )
+            model_epoch = model_epoch_list[0]
+        except:
+            print("Не удалось загрузить модель")
+
+    model.to(DEVICE)
 
     num_epochs = NUM_EPOCHS
     metric = mean_average_precision
     metric_name = "IOU"
     title = 'YOLO_V1'
-    loss_fn = YoloLoss(num_classes=NUM_CLASSES)
-
-    print(100 * "-", '\n', "Загрузка даталоадера \n", 100 * "-")
-    train_loader, valid_loader = get_data_loaders(path=PATH, num_images=100)
     
 
-    whole_train_valid_cycle(model=model, num_epochs=num_epochs, loss_fn=loss_fn, train_loader=train_loader, valid_loader=valid_loader, metric=metric, metric_name=metric_name, title=title)
+    print(100 * "-", '\n', "Загрузка даталоадера \n", 100 * "-")
+    train_loader, valid_loader = get_data_loaders(path=PATH, num_images=1000)
+    
+
+    whole_train_valid_cycle(model=model, num_epochs=num_epochs, loss_fn=loss_fn, train_loader=train_loader, valid_loader=valid_loader, metric=metric, metric_name=metric_name, 
+                            title=title,
+                            scheduler=scheduler,
+                            optimizer=optimizer)
 
 
 if __name__=="__main__":

@@ -1,4 +1,3 @@
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -179,92 +178,6 @@ def mean_average_precision(
     return sum(average_precisions) / len(average_precisions)
 
 
-def plot_image(image, boxes):
-    """Plots predicted bounding boxes on the image"""
-    cmap = plt.get_cmap("tab20b")
-    class_labels = config.COCO_LABELS if config.DATASET=='COCO' else config.PASCAL_CLASSES
-    colors = [cmap(i) for i in np.linspace(0, 1, len(class_labels))]
-    im = np.array(image)
-    height, width, _ = im.shape
-
-    # Create figure and axes
-    fig, ax = plt.subplots(1)
-    # Display the image
-    ax.imshow(im)
-
-    # box[0] is x midpoint, box[2] is width
-    # box[1] is y midpoint, box[3] is height
-
-    # Create a Rectangle patch
-    for box in boxes:
-        assert len(box) == 6, "box should contain class pred, confidence, x, y, width, height"
-        class_pred = box[0]
-        box = box[2:]
-        upper_left_x = box[0] - box[2] / 2
-        upper_left_y = box[1] - box[3] / 2
-        rect = patches.Rectangle(
-            (upper_left_x * width, upper_left_y * height),
-            box[2] * width,
-            box[3] * height,
-            linewidth=2,
-            edgecolor=colors[int(class_pred)],
-            facecolor="none",
-        )
-        # Add the patch to the Axes
-        ax.add_patch(rect)
-        plt.text(
-            upper_left_x * width,
-            upper_left_y * height,
-            s=class_labels[int(class_pred)],
-            color="white",
-            verticalalignment="top",
-            bbox={"color": colors[int(class_pred)], "pad": 0},
-        )
-
-    plt.show()
-
-
-
-def cells_to_bboxes(predictions, anchors, S, is_preds=True):
-    """
-    Scales the predictions coming from the model to
-    be relative to the entire image such that they for example later
-    can be plotted or.
-    INPUT:
-    predictions: tensor of size (N, 3, S, S, num_classes+5)
-    anchors: the anchors used for the predictions
-    S: the number of cells the image is divided in on the width (and height)
-    is_preds: whether the input is predictions or the true bounding boxes
-    OUTPUT:
-    converted_bboxes: the converted boxes of sizes (N, num_anchors, S, S, 1+5) with class index,
-                      object score, bounding box coordinates
-    """
-    BATCH_SIZE = predictions.shape[0]
-    num_anchors = len(anchors)
-    box_predictions = predictions[..., 1:5]
-    if is_preds:
-        anchors = anchors.reshape(1, len(anchors), 1, 1, 2)
-        box_predictions[..., 0:2] = torch.sigmoid(box_predictions[..., 0:2])
-        box_predictions[..., 2:] = torch.exp(box_predictions[..., 2:]) * anchors
-        scores = torch.sigmoid(predictions[..., 0:1])
-        best_class = torch.argmax(predictions[..., 5:], dim=-1).unsqueeze(-1)
-    else:
-        scores = predictions[..., 0:1]
-        best_class = predictions[..., 5:6]
-
-    cell_indices = (
-        torch.arange(S)
-        .repeat(predictions.shape[0], 3, S, 1)
-        .unsqueeze(-1)
-        .to(predictions.device)
-    )
-    x = 1 / S * (box_predictions[..., 0:1] + cell_indices)
-    y = 1 / S * (box_predictions[..., 1:2] + cell_indices.permute(0, 1, 3, 2, 4))
-    w_h = 1 / S * box_predictions[..., 2:4]
-    converted_bboxes = torch.cat((best_class, scores, x, y, w_h), dim=-1).reshape(BATCH_SIZE, num_anchors * S * S, 6)
-    return converted_bboxes.tolist()
-
-
 def check_class_accuracy(model, loader, threshold):
     model.eval()
     tot_class_preds, correct_class = 0, 0
@@ -313,26 +226,29 @@ def get_mean_std(loader):
     return mean, std
 
 
-def save_checkpoint(model, optimizer, filename="my_checkpoint.pth.tar"):
+def save_checkpoint(model, optimizer, model_epoch, filename="my_checkpoint.pt"):
     print("=> Saving checkpoint")
     checkpoint = {
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "epoch": model_epoch
     }
     torch.save(checkpoint, filename)
 
 
-def load_checkpoint(checkpoint_file, model, optimizer, lr):
+def load_checkpoint(checkpoint_file, model, optimizer, lr, model_epoch_list):
     print("=> Loading checkpoint")
     checkpoint = torch.load(checkpoint_file, map_location=DEVICE)
     model.load_state_dict(checkpoint["state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer"])
+    model_epoch = checkpoint["epoch"]
+    model_epoch_list.append(model_epoch)
 
     # If we don't do this then it will just have learning rate of old checkpoint
     # and it will lead to many hours of debugging \:
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-
+    
 
 def get_data_loaders(path: str, num_images=None):
 
@@ -361,8 +277,8 @@ def get_data_loaders(path: str, num_images=None):
     return train_loader, test_loader
 
 
-def non_maximum_suppression(input, iou_threshold=0.5, confidence_threshold=0.5):
-    # Предполагаем, что tensor имеет размер [3, 3, 13, 13, 25]
+def non_max_suppression(input: torch.Tensor, iou_threshold:float=0.5 , confidence_threshold:float=0.5):
+    # Предполагаем, что tensor имеет размер [bs, 3, 13, 13, 25]
     batch_size, num_anchors, grid_h, grid_w, num_classes = input.shape
 
     # Преобразуем тензор в удобный формат
@@ -441,5 +357,5 @@ if __name__ == "__main__":
         print(predictions_1.shape)
         
         # print(output_1.view(-1, 85).shape)
-        non_maximum_suppression(predictions_1, confidence_threshold=0.05)
+        non_max_suppression(predictions_1, confidence_threshold=0.05)
         

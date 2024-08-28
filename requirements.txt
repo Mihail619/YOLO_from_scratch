@@ -1,2 +1,6 @@
 torch
 torchvision
+pandas
+numpy
+matplotlib
+albumentations

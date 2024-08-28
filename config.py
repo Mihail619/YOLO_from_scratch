@@ -4,16 +4,23 @@ import cv2
 import torch
 import os
 
+
 os.environ['ALBUMENTATIONS_DISABLE_CHECKING_VERSION'] = '1'
 
-NUM_EPOCHS = 1
+NUM_EPOCHS = 3
+NUM_IMAGES = 1000
+
+DATASET = 'PASCAL_VOC'
+CHECKPOINT_FILE = "models\\YOLO_V1_0.pt"
 
 PATH = "D:\\Learning\\Datasets\\PASCAL_VOC"
+
 ANCHORS = [
-    ((0.28, 0.22), (0.38, 0.48), (0.9, 0.78)),
-    ((0.07, 0.15), (0.15, 0.11), (0.14, 0.29)),
-    ((0.02, 0.03), (0.04, 0.07), (0.08, 0.06)),
+    [(0.28, 0.22), (0.38, 0.48), (0.9, 0.78)],
+    [(0.07, 0.15), (0.15, 0.11), (0.14, 0.29)],
+    [(0.02, 0.03), (0.04, 0.07), (0.08, 0.06)],
 ]  # Note these have been rescaled to be between [0, 1]
+
 IMAGE_SIZE = 416
 SIZES = [52, 26, 13]
 BATCH_SIZE = 32
@@ -22,6 +29,9 @@ PIN_MEMORY = True
 NUM_CLASSES = 20
 BACKBONE_NUM_CHANNELS = [128, 256, 512]
 NUMBER_BLOCKS_LIST = [3, 4, 4, 3]
+LOAD_MODEL = True
+
+LEARNING_RATE = 1e-3
 
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -80,3 +90,109 @@ test_transforms = A.Compose(
     ],
     bbox_params=A.BboxParams(format="yolo", min_visibility=0.4, label_fields=[]),
 )
+
+
+PASCAL_CLASSES = [
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor"
+]
+
+COCO_CLASSES = ['person',
+ 'bicycle',
+ 'car',
+ 'motorcycle',
+ 'airplane',
+ 'bus',
+ 'train',
+ 'truck',
+ 'boat',
+ 'traffic light',
+ 'fire hydrant',
+ 'stop sign',
+ 'parking meter',
+ 'bench',
+ 'bird',
+ 'cat',
+ 'dog',
+ 'horse',
+ 'sheep',
+ 'cow',
+ 'elephant',
+ 'bear',
+ 'zebra',
+ 'giraffe',
+ 'backpack',
+ 'umbrella',
+ 'handbag',
+ 'tie',
+ 'suitcase',
+ 'frisbee',
+ 'skis',
+ 'snowboard',
+ 'sports ball',
+ 'kite',
+ 'baseball bat',
+ 'baseball glove',
+ 'skateboard',
+ 'surfboard',
+ 'tennis racket',
+ 'bottle',
+ 'wine glass',
+ 'cup',
+ 'fork',
+ 'knife',
+ 'spoon',
+ 'bowl',
+ 'banana',
+ 'apple',
+ 'sandwich',
+ 'orange',
+ 'broccoli',
+ 'carrot',
+ 'hot dog',
+ 'pizza',
+ 'donut',
+ 'cake',
+ 'chair',
+ 'couch',
+ 'potted plant',
+ 'bed',
+ 'dining table',
+ 'toilet',
+ 'tv',
+ 'laptop',
+ 'mouse',
+ 'remote',
+ 'keyboard',
+ 'cell phone',
+ 'microwave',
+ 'oven',
+ 'toaster',
+ 'sink',
+ 'refrigerator',
+ 'book',
+ 'clock',
+ 'vase',
+ 'scissors',
+ 'teddy bear',
+ 'hair drier',
+ 'toothbrush'
+]
