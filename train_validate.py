@@ -211,7 +211,8 @@ def main():
     whole_train_valid_cycle(model=model, num_epochs=num_epochs, loss_fn=loss_fn, train_loader=train_loader, valid_loader=valid_loader, metric=metric, metric_name=metric_name, 
                             title=title,
                             scheduler=scheduler,
-                            optimizer=optimizer)
+                            optimizer=optimizer,
+                            model_epoch=model_epoch)
 
 
 if __name__=="__main__":

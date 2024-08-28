@@ -241,8 +241,19 @@ def load_checkpoint(checkpoint_file, model, optimizer, lr, model_epoch_list):
     checkpoint = torch.load(checkpoint_file, map_location=DEVICE)
     model.load_state_dict(checkpoint["state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer"])
-    model_epoch = checkpoint["epoch"]
+
+    # Доработать эти строки после обновления модели
+    try:
+        model_epoch = checkpoint["epoch"]
+    except:
+        model_epoch = 0
     model_epoch_list.append(model_epoch)
+    
+    # Перемещаем состояние оптимизатора на нужное устройство
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(DEVICE)
 
     # If we don't do this then it will just have learning rate of old checkpoint
     # and it will lead to many hours of debugging \:
