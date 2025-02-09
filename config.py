@@ -7,40 +7,52 @@ import os
 
 os.environ['ALBUMENTATIONS_DISABLE_CHECKING_VERSION'] = '1'
 
-NUM_EPOCHS = 3
-NUM_IMAGES = 1000
 
-DATASET = 'PASCAL_VOC'
-CHECKPOINT_FILE = "models\\YOLO_V1_0.pt"
 
-PATH = "D:\\Learning\\Datasets\\PASCAL_VOC"
+DATASET_TYPE = 'PASCAL_VOC'
+# DATASET_TYPE = 'COCO'
+
+NUM_EPOCHS = 1
+CHECKPOINT_FILE = "models\\V1_E_  161_LOSS_34.86.pt"
+NUM_IMAGES = 3 #None
+LOAD_MODEL = False
+
+NEED_TO_CHANGE_LR = True
+SCHEDULER_STEP = 5
+MODEL_NAME = "YOLO_V1_wth blocks"
+
+
+if DATASET_TYPE == 'PASCAL_VOC':
+    PATH = "D:\\Learning\\Datasets\\PASCAL_VOC"
+elif DATASET_TYPE == 'COCO':
+    PATH = "D:\\Learning\\Datasets\\coco2017"
+
 
 ANCHORS = [
     [(0.28, 0.22), (0.38, 0.48), (0.9, 0.78)],
     [(0.07, 0.15), (0.15, 0.11), (0.14, 0.29)],
     [(0.02, 0.03), (0.04, 0.07), (0.08, 0.06)],
-]  # Note these have been rescaled to be between [0, 1]
+]
 
 IMAGE_SIZE = 416
-SIZES = [52, 26, 13]
+SIZES = [13, 26, 52]
+GRID_SIZES = [IMAGE_SIZE // 32, IMAGE_SIZE // 16, IMAGE_SIZE // 8]
 BATCH_SIZE = 32
-NUM_WORKERS = 4
+NUM_WORKERS = 0
 PIN_MEMORY = True
-NUM_CLASSES = 20
+
 BACKBONE_NUM_CHANNELS = [128, 256, 512]
-NUMBER_BLOCKS_LIST = [3, 4, 4, 3]
-LOAD_MODEL = True
+NUMBER_BLOCKS_LIST = [3, 4, 6, 3]
+LEARNING_RATE = 1e-5
 
-LEARNING_RATE = 1e-3
-
+CONF_THRESHOLD = 0.5
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
-
 scale = 1.2
 
-train_transforms = A.Compose(
+TRAIN_TRANSFORMS = A.Compose(
     [
         # A.Resize(height=IMAGE_SIZE, width=IMAGE_SIZE),
         A.LongestMaxSize(max_size=int(IMAGE_SIZE * scale)),
@@ -73,7 +85,7 @@ train_transforms = A.Compose(
     ],
     bbox_params=A.BboxParams(format="yolo", min_visibility=0.4, label_fields=[],),
 )
-test_transforms = A.Compose(
+TEST_TRANSFORMS = A.Compose(
     [
         # A.Resize(height=IMAGE_SIZE, width=IMAGE_SIZE),
         A.LongestMaxSize(max_size=IMAGE_SIZE),
@@ -92,7 +104,7 @@ test_transforms = A.Compose(
 )
 
 
-PASCAL_CLASSES = [
+PASCAL_CLASSES =[
     "aeroplane",
     "bicycle",
     "bird",
@@ -114,6 +126,7 @@ PASCAL_CLASSES = [
     "train",
     "tvmonitor"
 ]
+
 
 COCO_CLASSES = ['person',
  'bicycle',
@@ -196,3 +209,93 @@ COCO_CLASSES = ['person',
  'hair drier',
  'toothbrush'
 ]
+
+if DATASET_TYPE == 'PASCAL_VOC':
+    NUM_CLASSES = 20
+else:
+    NUM_CLASSES = 80
+
+
+'''Словарь для преобразования класса из исходного датасета coco в индексы, которые используются в модели
+'''
+COCO_original_classes_to_list_idx = {
+    1: 0,
+    2: 1,
+    3: 2,
+    4: 3,
+    5: 4,
+    6: 5,
+    7: 6,
+    8: 7,
+    9: 8,
+    10: 9,
+    11: 10,
+    13: 11,
+    14: 12,
+    15: 13,
+    16: 14,
+    17: 15,
+    18: 16,
+    19: 17,
+    20: 18,
+    21: 19,
+    22: 20,
+    23: 21,
+    24: 22,
+    25: 23,
+    27: 24,
+    28: 25,
+    31: 26,
+    32: 27,
+    33: 28,
+    34: 29,
+    35: 30,
+    36: 31,
+    37: 32,
+    38: 33,
+    39: 34,
+    40: 35,
+    41: 36,
+    42: 37,
+    43: 38,
+    44: 39,
+    46: 40,
+    47: 41,
+    48: 42,
+    49: 43,
+    50: 44,
+    51: 45,
+    52: 46,
+    53: 47,
+    54: 48,
+    55: 49,
+    56: 50,
+    57: 51,
+    58: 52,
+    59: 53,
+    60: 54,
+    61: 55,
+    62: 56,
+    63: 57,
+    64: 58,
+    65: 59,
+    67: 60,
+    70: 61,
+    72: 62,
+    73: 63,
+    74: 64,
+    75: 65,
+    76: 66,
+    77: 67,
+    78: 68,
+    79: 69,
+    80: 70,
+    81: 71,
+    82: 72,
+    84: 73,
+    85: 74,
+    86: 75,
+    87: 76,
+    88: 77,
+    89: 78,
+    90: 79}

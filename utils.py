@@ -4,251 +4,353 @@ import numpy as np
 import os
 import random
 import torch
-import torchvision
+from torch import nn
+from torch.optim import Adam
+import torchvision.ops as ops
+
 
 from collections import Counter
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-import config
-from dataset import VOCYOLODataset
-
-from config import (PATH, ANCHORS, IMAGE_SIZE, SIZES, DEVICE, BATCH_SIZE, NUM_WORKERS, PIN_MEMORY, train_transforms, test_transforms)
-from iou_utils import iou
+from logger_config import logger
 
 
-def intersection_over_union(boxes_preds:torch.Tensor, boxes_labels:torch.Tensor, box_format="midpoint"):
+from config import (
+    DATASET_TYPE,
+    NUM_CLASSES,
+    IMAGE_SIZE,
+    SIZES,
+    DEVICE,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    PIN_MEMORY,
+    TRAIN_TRANSFORMS,
+    LOAD_MODEL,
+    NEED_TO_CHANGE_LR,
+    LEARNING_RATE
+)
+from my_yolo_model import YOLO
+
+
+# Defining a function to calculate Intersection over Union (IoU)
+def iou(box1, box2, is_pred=True):
+    if is_pred:
+        # IoU score for prediction and label
+        # box1 (prediction) and box2 (label) are both in [x, y, width, height] format
+
+        # Box coordinates of prediction
+        b1_x1 = box1[..., 0:1] - box1[..., 2:3] / 2
+        b1_y1 = box1[..., 1:2] - box1[..., 3:4] / 2
+        b1_x2 = box1[..., 0:1] + box1[..., 2:3] / 2
+        b1_y2 = box1[..., 1:2] + box1[..., 3:4] / 2
+
+        # Box coordinates of ground truth
+        b2_x1 = box2[..., 0:1] - box2[..., 2:3] / 2
+        b2_y1 = box2[..., 1:2] - box2[..., 3:4] / 2
+        b2_x2 = box2[..., 0:1] + box2[..., 2:3] / 2
+        b2_y2 = box2[..., 1:2] + box2[..., 3:4] / 2
+
+        # Get the coordinates of the intersection rectangle
+        x1 = torch.max(b1_x1, b2_x1)
+        y1 = torch.max(b1_y1, b2_y1)
+        x2 = torch.min(b1_x2, b2_x2)
+        y2 = torch.min(b1_y2, b2_y2)
+        # Make sure the intersection is at least 0
+        intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+
+        # Calculate the union area
+        box1_area = abs((b1_x2 - b1_x1) * (b1_y2 - b1_y1))
+        box2_area = abs((b2_x2 - b2_x1) * (b2_y2 - b2_y1))
+        union = box1_area + box2_area - intersection
+
+        # Calculate the IoU score
+        epsilon = 1e-6
+        iou_score = intersection / (union + epsilon)
+
+        # Return IoU score
+        return iou_score
+
+    else:
+        # IoU score based on width and height of bounding boxes
+
+        # Calculate intersection area
+        intersection_area = torch.min(box1[..., 0], box2[..., 0]) * torch.min(
+            box1[..., 1], box2[..., 1]
+        )
+
+        # Calculate union area
+        box1_area = box1[..., 0] * box1[..., 1]
+        box2_area = box2[..., 0] * box2[..., 1]
+        union_area = box1_area + box2_area - intersection_area
+
+        # Calculate IoU score
+        iou_score = intersection_area / union_area
+
+        # Return IoU score
+        return iou_score
+
+
+# Non-maximum suppression function to remove overlapping bounding boxes
+def custom_nms(bboxes, iou_threshold, threshold):
+    # Filter out bounding boxes with confidence below the threshold.
+    # bboxes = [box for box in bboxes if box[1] > threshold]
+    mask = bboxes[..., 1] > threshold
+    bboxes = bboxes[mask]
+    bboxes = bboxes.tolist()
+
+    # Sort the bounding boxes by confidence in descending order.
+    bboxes = sorted(bboxes, key=lambda x: x[1], reverse=True)
+
+    # Initialize the list of bounding boxes after non-maximum suppression.
+    bboxes_nms = []
+
+    while bboxes:
+        # Get the first bounding box.
+        first_box = bboxes.pop(0)
+
+        # Iterate over the remaining bounding boxes.
+        for box in bboxes:
+            # If the bounding boxes do not overlap or if the first bounding box has
+            # a higher confidence, then add the second bounding box to the list of
+            # bounding boxes after non-maximum suppression.
+            if (
+                box[0] != first_box[0]
+                or iou(
+                    torch.tensor(first_box[2:]),
+                    torch.tensor(box[2:]),
+                )
+                < iou_threshold
+            ):
+                # Check if box is not in bboxes_nms
+                if box not in bboxes_nms:
+                    # Add box to bboxes_nms
+                    bboxes_nms.append(box)
+
+    # Return bounding boxes after non-maximum suppression.
+    return bboxes_nms
+
+
+# Function to convert cells to bounding boxes
+def convert_cells_to_bboxes(input_boxes, anchors, size: float, is_predictions=True) -> torch.Tensor:
+
     """
-    Video explanation of this function:
-    https://youtu.be/XXYG5ZWtjj0
+    inputs:
+        - predictions: Tensor of shape (batch_size, grid_size, grid_size, anchors, 5 + num_classes)
+        - anchors: List of anchors
+        - size: Size of the image
+        - is_predictions: Boolean value indicating whether the input is predictions or not
 
-    This function calculates intersection over union (iou) given pred boxes
-    and target boxes.
-
-    Parameters:
-        boxes_preds (tensor): Predictions of Bounding Boxes (BATCH_SIZE, num_anchors, 4)
-        boxes_labels (tensor): Correct labels of Bounding Boxes (BATCH_SIZE, num_anchors, 4)
-        box_format (str): midpoint/corners, if boxes (x,y,w,h) or (x1,y1,x2,y2)
-
-    Returns:
-        tensor: Intersection over union for all examples
+    returns:
+        - bboxes: Tensor of shape (batch_size, grid_size * grid_size * anchors, 6)
+        last channel is:
+        (confidence(scores), x, y, width, height, best_class)
     """
+    # Batch size used on predictions
+    batch_size = input_boxes.shape[0]
+    # Number of anchors
+    num_anchors = len(anchors)
+    # List of all the predictions
+    box_predictions = input_boxes[..., 1:5] # x, y, w, h
 
-    if box_format == "midpoint":
-        box1_x1 = boxes_preds[..., 0:1] - boxes_preds[..., 2:3] / 2
-        box1_y1 = boxes_preds[..., 1:2] - boxes_preds[..., 3:4] / 2
-        box1_x2 = boxes_preds[..., 0:1] + boxes_preds[..., 2:3] / 2
-        box1_y2 = boxes_preds[..., 1:2] + boxes_preds[..., 3:4] / 2
+    # If the input is predictions then we will pass the x and y coordinate
+    # through sigmoid function and width and height to exponent function and
+    # calculate the score and best class.
+    if is_predictions:
+        anchors = anchors.reshape(1, len(anchors), 1, 1, 2)
+        box_predictions[..., 0:2] = torch.sigmoid(box_predictions[..., 0:2]) # x, y
+        box_predictions[..., 2:] = torch.exp(box_predictions[..., 2:]) * anchors # w, h
+        scores = torch.sigmoid(input_boxes[..., 0:1])
+        best_class = torch.argmax(input_boxes[..., 5:], dim=-1).unsqueeze(-1)
 
-        box2_x1 = boxes_labels[..., 0:1] - boxes_labels[..., 2:3] / 2
-        box2_y1 = boxes_labels[..., 1:2] - boxes_labels[..., 3:4] / 2
-        box2_x2 = boxes_labels[..., 0:1] + boxes_labels[..., 2:3] / 2
-        box2_y2 = boxes_labels[..., 1:2] + boxes_labels[..., 3:4] / 2
-
-    if box_format == "corners":
-        box1_x1 = boxes_preds[..., 0:1]
-        box1_y1 = boxes_preds[..., 1:2]
-        box1_x2 = boxes_preds[..., 2:3]
-        box1_y2 = boxes_preds[..., 3:4]
-        box2_x1 = boxes_labels[..., 0:1]
-        box2_y1 = boxes_labels[..., 1:2]
-        box2_x2 = boxes_labels[..., 2:3]
-        box2_y2 = boxes_labels[..., 3:4]
-
-    x1 = torch.max(box1_x1, box2_x1)
-    y1 = torch.max(box1_y1, box2_y1)
-    x2 = torch.min(box1_x2, box2_x2)
-    y2 = torch.min(box1_y2, box2_y2)
-
-    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
-    box1_area = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
-    box2_area = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
-
-    return intersection / (box1_area + box2_area - intersection + 1e-6)
+    # Else we will just calculate scores and best class.
+    else:
+        scores = input_boxes[..., 0:1]
+        best_class = input_boxes[..., 5:6]
 
 
-def mean_average_precision(
-    pred_boxes: list, true_boxes: list, iou_threshold: float =0.5 , box_format="midpoint", num_classes=20
+    # создаем матрицу индексов ячеек
+    cell_indices_X = (torch.arange(size).view(1, 1, size, 1, 1).expand(batch_size, num_anchors, size, size, 1).to(DEVICE))
+    cell_indices_Y = (torch.arange(size).view(1, 1, 1, size, 1).expand(batch_size, num_anchors, size, size, 1).to(DEVICE))
+
+
+    # Calculate x, y, width and height with proper scaling
+    x = 1 / size * (box_predictions[..., 0:1] + cell_indices_X)
+    y = 1 / size * (box_predictions[..., 1:2] + cell_indices_Y)
+    width_height = 1 / size * box_predictions[..., 2:4]
+
+    # Concatinating the values and reshaping them in
+    # (BATCH_SIZE, num_anchors * S * S, 6) shape
+    converted_bboxes = torch.cat(
+        (scores, x, y, width_height, best_class), dim=-1
+    ).reshape(batch_size, num_anchors * size * size, 6)
+
+    # Returning the reshaped and converted bounding box list
+    return converted_bboxes
+
+
+def get_true_bboxes_in_batch(
+    input_bboxes,   
+    iou_threshold,
+    scaled_anchors,
+    conf_threshold,
+    is_preds=True
 ):
     """
-    Video explanation of this function:
-    https://youtu.be/FppOzcDvaDI
-
-    This function calculates mean average precision (mAP)
-
-    Parameters:
-        pred_boxes (list): list of lists containing all bboxes with each bboxes
-        specified as [train_idx, class_prediction, prob_score, x1, y1, x2, y2]
-        true_boxes (list): Similar as pred_boxes except all the correct ones
-        iou_threshold (float): threshold where predicted bboxes is correct
-        box_format (str): "midpoint" or "corners" used to specify bboxes
-        num_classes (int): number of classes
-
-    Returns:
-        float: mAP value across all classes given a specific IoU threshold
+    input_bboxes - Это или предсказания модели или label
+    если это label:
+    input_bboxes - list of tensors, each tensor is a batch of labels:
+        [bs, num_anchors, grid_size, grid_size, 6]
+        last 6 values are [is_object, x, y, w, h, class]
+    если это предсказания:
+    input_bboxes - list of tensors, each tensor is a batch of outputs:
+        [bs, num_anchors, grid_size, grid_size, 25]
+        last 25 values are [conf, x, y, w, h, 20 classes confidence]
+    threshold - threshold for objectness score
+    
     """
 
-    # list storing all AP for respective classes
-    average_precisions = []
+    all_boxes_array = np.array([], dtype=object)
+    
+    batch_size = input_bboxes[0].shape[0]
+    num_shapes = len(input_bboxes)
 
-    # used for numerical stability later on
-    epsilon = 1e-6
+    all_bboxes = torch.Tensor()
 
-    for c in range(num_classes):
-        detections = []
-        ground_truths = []
+    for i in range(num_shapes):
+        size = input_bboxes[i].shape[2]
+        
+        
+        converted_boxes = convert_cells_to_bboxes(
+            input_bboxes[i], anchors=scaled_anchors[i], size=size, is_predictions=is_preds
+        )
+        all_bboxes = torch.cat((all_bboxes, converted_boxes), dim=1)
+    print(f"{all_bboxes.shape=}")
 
-        # Go through all predictions and targets,
-        # and only add the ones that belong to the
-        # current class c
-        for detection in pred_boxes:
-            if detection[1] == c:
-                detections.append(detection)
+    all_bboxes[..., 1:5] = xywh2xyxy(all_bboxes[..., 1:5])
 
-        for true_box in true_boxes:
-            if true_box[1] == c:
-                ground_truths.append(true_box)
-
-        # find the amount of bboxes for each training example
-        # Counter here finds how many ground truth bboxes we get
-        # for each training example, so let's say img 0 has 3,
-        # img 1 has 5 then we will obtain a dictionary with:
-        # amount_bboxes = {0:3, 1:5}
-        amount_bboxes = Counter([gt[0] for gt in ground_truths])
-
-        # We then go through each key, val in this dictionary
-        # and convert to the following (w.r.t same example):
-        # ammount_bboxes = {0:torch.tensor[0,0,0], 1:torch.tensor[0,0,0,0,0]}
-        for key, val in amount_bboxes.items():
-            amount_bboxes[key] = torch.zeros(val)
-
-        # sort by box probabilities which is index 2
-        detections.sort(key=lambda x: x[2], reverse=True)
-        TP = torch.zeros((len(detections)))
-        FP = torch.zeros((len(detections)))
-        total_true_bboxes = len(ground_truths)
-
-        # If none exists for this class then we can safely skip
-        if total_true_bboxes == 0:
-            continue
-
-        for detection_idx, detection in enumerate(detections):
-            # Only take out the ground_truths that have the same
-            # training idx as detection
-            ground_truth_img = [
-                bbox for bbox in ground_truths if bbox[0] == detection[0]
-            ]
-
-            num_gts = len(ground_truth_img)
-            best_iou = 0
-
-            for idx, gt in enumerate(ground_truth_img):
-                iou = intersection_over_union(
-                    torch.tensor(detection[3:]),
-                    torch.tensor(gt[3:]),
-                    box_format=box_format,
-                )
-
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = idx
-
-            if best_iou > iou_threshold:
-                # only detect ground truth detection once
-                if amount_bboxes[detection[0]][best_gt_idx] == 0:
-                    # true positive and add this bounding box to seen
-                    TP[detection_idx] = 1
-                    amount_bboxes[detection[0]][best_gt_idx] = 1
-                else:
-                    FP[detection_idx] = 1
-
-            # if IOU is lower then the detection is a false positive
-            else:
-                FP[detection_idx] = 1
-
-        TP_cumsum = torch.cumsum(TP, dim=0)
-        FP_cumsum = torch.cumsum(FP, dim=0)
-        recalls = TP_cumsum / (total_true_bboxes + epsilon)
-        precisions = TP_cumsum / (TP_cumsum + FP_cumsum + epsilon)
-        precisions = torch.cat((torch.tensor([1]), precisions))
-        recalls = torch.cat((torch.tensor([0]), recalls))
-        # torch.trapz for numerical integration
-        average_precisions.append(torch.trapz(precisions, recalls))
-
-    return sum(average_precisions) / len(average_precisions)
+    boxes = all_bboxes[..., 1:5]
+    scores = all_bboxes[..., 0]
+    class_ids = all_bboxes[..., 5:]
+    
+    keep_indices = ops.batched_nms(boxes=boxes, scores=scores, idxs=class_ids, iou_threshold=iou_threshold)
+    filtered_all_boxes = all_bboxes[keep_indices]
+    print(f"{filtered_all_boxes.shape=}")
 
 
-def check_class_accuracy(model, loader, threshold):
-    model.eval()
-    tot_class_preds, correct_class = 0, 0
-    tot_noobj, correct_noobj = 0, 0
-    tot_obj, correct_obj = 0, 0
 
-    for idx, (x, y) in enumerate(tqdm(loader)):
-        x = x.to(DEVICE)
-        with torch.no_grad():
-            out = model(x)
+def get_true_bboxes(
+    input_bboxes: list,   
+    iou_threshold: float,
+    scaled_anchors: torch.Tensor,
+    conf_threshold: float,
+    is_preds=True
+) -> list:
+    """
+    inputs
+        input_bboxes - Это или предсказания модели или label
+        если это label:
+        input_bboxes - list of tensors, each tensor is a batch of labels:
+            [bs, num_anchors, grid_size, grid_size, 6]
+            last 6 values are [object_confidence, x, y, w, h, class]
+        если это предсказания:
+        input_bboxes - list of tensors, each tensor is a batch of outputs:
+            [bs, num_anchors, grid_size, grid_size, 25]
+            last 25 values are [conf, x, y, w, h, 20 classes confidence]
+        threshold - threshold for objectness score
+    returns:
+        list of tensors, each tensor is a batch of true outputs:
+            [num_boxes, 6]
+            last 6 values are [object_confidence, x, y, x, y, best_class]
+    """
 
-        for i in range(3):
-            y[i] = y[i].to(DEVICE)
-            obj = y[i][..., 0] == 1 # in paper this is Iobj_i
-            noobj = y[i][..., 0] == 0  # in paper this is Iobj_i
+    all_boxes_list = []
+    
+    batch_size = input_bboxes[0].shape[0]
+    num_shapes = len(input_bboxes)
 
-            correct_class += torch.sum(
-                torch.argmax(out[i][..., 5:][obj], dim=-1) == y[i][..., 5][obj]
-            )
-            tot_class_preds += torch.sum(obj)
+    all_bboxes = torch.Tensor().to(DEVICE)
 
-            obj_preds = torch.sigmoid(out[i][..., 0]) > threshold
-            correct_obj += torch.sum(obj_preds[obj] == y[i][..., 0][obj])
-            tot_obj += torch.sum(obj)
-            correct_noobj += torch.sum(obj_preds[noobj] == y[i][..., 0][noobj])
-            tot_noobj += torch.sum(noobj)
+    for i in range(num_shapes):
+        size = input_bboxes[i].shape[2]        
+        
+        converted_boxes = convert_cells_to_bboxes(
+            input_bboxes[i], anchors=scaled_anchors[i], size=size, is_predictions=is_preds
+        )
+        all_bboxes = torch.cat((all_bboxes, converted_boxes), dim=1)
+    
 
-    print(f"Class accuracy is: {(correct_class/(tot_class_preds+1e-16))*100:2f}%")
-    print(f"No obj accuracy is: {(correct_noobj/(tot_noobj+1e-16))*100:2f}%")
-    print(f"Obj accuracy is: {(correct_obj/(tot_obj+1e-16))*100:2f}%")
-    model.train()
-
-
-def get_mean_std(loader):
-    # var[X] = E[X**2] - E[X]**2
-    channels_sum, channels_sqrd_sum, num_batches = 0, 0, 0
-
-    for data, _ in tqdm(loader):
-        channels_sum += torch.mean(data, dim=[0, 2, 3])
-        channels_sqrd_sum += torch.mean(data ** 2, dim=[0, 2, 3])
-        num_batches += 1
-
-    mean = channels_sum / num_batches
-    std = (channels_sqrd_sum / num_batches - mean ** 2) ** 0.5
-
-    return mean, std
+    all_bboxes[..., 1:5] = xywh2xyxy(all_bboxes[..., 1:5])
 
 
-def save_checkpoint(model, optimizer, model_epoch, filename="my_checkpoint.pt"):
+    
+    for i in range(batch_size):
+        one_img_boxes = all_bboxes[i].detach().to()
+        # Фильтрация по confidence
+        conf_mask = one_img_boxes[..., 0] >= conf_threshold
+        one_img_boxes = one_img_boxes[conf_mask]
+
+        img_boxes = one_img_boxes[..., 1:5]
+        img_scores = one_img_boxes[..., 0]
+        class_ids = one_img_boxes[..., 5:]
+        
+        keep_indices = ops.nms(boxes=img_boxes, scores=img_scores, iou_threshold=iou_threshold)
+    
+        filtered_img_boxes = one_img_boxes[keep_indices]
+        all_boxes_list.append(filtered_img_boxes)
+
+    return all_boxes_list
+
+
+def save_checkpoint(model, optimizer, model_epoch, dataset_type:str, filename="my_checkpoint.pt", ):
     print("=> Saving checkpoint")
     checkpoint = {
         "state_dict": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "epoch": model_epoch
+        "epoch": model_epoch,
+        "model_dataset_type": dataset_type
     }
     torch.save(checkpoint, filename)
 
 
-def load_checkpoint(checkpoint_file, model, optimizer, lr, model_epoch_list):
-    print("=> Loading checkpoint")
-    checkpoint = torch.load(checkpoint_file, map_location=DEVICE)
+def convert_pascal_to_coco_model(checkpoint, model, optimizer, lr, model_epoch_list):
+    """
+    Задача функции - загрузить сохраннную модель которая обучалась на датасете pascal_voc,
+    а потом заменить в ней выхходные слои для обучения на датасете coco
+
+    # создаем модель, которая соответствуем сохраненной модели pascal_voc
+    # создаем оптимизатор, который соответствуем сохраненному оптимизатору
+    # загружаем модель и оптимизатор из чекпоинта
+    # меняем выходные слои
+    args:
+        model - модель, которую мы загружаем
+        optimizer - оптимизатор, который мы загружаем
+        lr - learning rate, который мы загружаем
+        model_epoch_list - список, в который мы добавляем номер эпохи, которую мы загружаем
+    outputs:
+        model, optimizer - модель и оптимизатор, которые мы загрузили и доработали
+    """
+
+    print("=> Starting model conversion from PASCAL VOC to COCO dataset")
+
+    
+    model = YOLO(num_classes=20)
+    optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
     model.load_state_dict(checkpoint["state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer"])
+    model_epoch_list.append(checkpoint["epoch"])
+    # Замеям выходные слои модели
+    # head_1
+    head1_pred_in_channels = model.head1.pred_layer.in_channels
+    model.head1.pred_layer = nn.Conv2d(head1_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head1.num_classes = NUM_CLASSES
+    # head_2
+    head2_pred_in_channels = model.head2.pred_layer.in_channels
+    model.head2.pred_layer = nn.Conv2d(head2_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head2.num_classes = NUM_CLASSES
+    # head_3
+    head3_pred_in_channels = model.head3.pred_layer.in_channels
+    model.head3.pred_layer = nn.Conv2d(head3_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head3.num_classes = NUM_CLASSES
+        
 
-    # Доработать эти строки после обновления модели
-    try:
-        model_epoch = checkpoint["epoch"]
-    except:
-        model_epoch = 0
-    model_epoch_list.append(model_epoch)
-    
     # Перемещаем состояние оптимизатора на нужное устройство
     for state in optimizer.state.values():
         for k, v in state.items():
@@ -257,116 +359,132 @@ def load_checkpoint(checkpoint_file, model, optimizer, lr, model_epoch_list):
 
     # If we don't do this then it will just have learning rate of old checkpoint
     # and it will lead to many hours of debugging \:
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+    if NEED_TO_CHANGE_LR:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
     
+    optimizer = Adam([
+            {'params': model.backbone.parameters(), 'lr': LEARNING_RATE * 0.1},  # Lower lr for pretrained layers
+            {'params': model.head1.pred_layer.parameters(), 'lr': LEARNING_RATE},  # Higher lr for new layers
+            {'params': model.head2.pred_layer.parameters(), 'lr': LEARNING_RATE},
+            {'params': model.head3.pred_layer.parameters(), 'lr': LEARNING_RATE}
+        ])
 
-def get_data_loaders(path: str, num_images=None):
+
+    return model, optimizer
 
 
-    train_dataset = VOCYOLODataset(dir_path=path, anchors=ANCHORS, scales=SIZES, train=True, transform=train_transforms, num_images=num_images)
+
+def convert_coco_to_pascal_model(checkpoint, model, optimizer, lr, model_epoch_list):
+    """
+    Задача функции - загрузить сохраннную модель которая обучалась на датасете COCO,
+    а потом заменить в ней выхходные слои для обучения на датасете PASCAL_VOC
+
+    # создаем модель, которая соответствуем сохраненной модели COCO
+    # создаем оптимизатор, который соответствуем сохраненному оптимизатору
+    # загружаем модель и оптимизатор из чекпоинта
+    # меняем выходные слои
+    args:
+        model - модель, которую мы загружаем
+        optimizer - оптимизатор, который мы загружаем
+        lr - learning rate, который мы загружаем
+        model_epoch_list - список, в который мы добавляем номер эпохи, которую мы загружаем
+    outputs:
+        model, optimizer - модель и оптимизатор, которые мы загрузили и доработали
+    """
+
+    print("=> Starting model conversion from COCO to PASCAL VOC dataset")
+
     
-    test_dataset = VOCYOLODataset(dir_path=path, anchors=ANCHORS, scales=SIZES, train=False, transform=test_transforms, num_images=num_images)
-
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
-        shuffle=True,
-        drop_last=False,
-    )
-    test_loader = DataLoader(
-        dataset=test_dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY,
-        shuffle=False,
-        drop_last=False,
-    )
-    
-    return train_loader, test_loader
-
-
-def non_max_suppression(input: torch.Tensor, iou_threshold:float=0.5 , confidence_threshold:float=0.5):
-    # Предполагаем, что tensor имеет размер [bs, 3, 13, 13, 25]
-    batch_size, num_anchors, grid_h, grid_w, num_classes = input.shape
-
-    # Преобразуем тензор в удобный формат
-    input = input.reshape(batch_size, num_anchors * grid_h * grid_w, num_classes)
-    print(f"Reshaped input = {input.shape}")
-
-    # Получаем уверенность, координаты и классы
-    confidence = input[..., 0]
-    print(f"{confidence.max()=}")
-    boxes = input[..., 1:5]
-    print(f'{boxes.shape=}')
-    classes = input[..., 5:]
-    
-    # Применяем порог уверенности
-    mask = confidence > confidence_threshold
-    print(f"{mask.shape=}")
-    print(f"{mask[0]=}")
-
-    input = input[mask]
-    print(f'Masked input = {input.shape=}')
-    
-    print(len(input))
-    if len(input) == 0:
-        return input
-    
-    # Получаем индексы отсортированных по убыванию уверенности боксов
-    _, indices = torch.sort(input[:, 0], descending=True)
-    print(f"{indices.shape = }, \n, {indices = }")
-    keep = []
-    print(f"{indices.numel()=}")
-    # до тех пор пока в количество элементов в тензоре indices > 0
-    while indices.numel() > 0:
-        # Сохраняем индекс бокса с наибольшей уверенностью
-        index = indices[0]
-        keep.append(index)
+    model = YOLO(num_classes=80)
+    optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
+    model.load_state_dict(checkpoint["state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    model_epoch_list.append(checkpoint["epoch"])
+    # Замеям выходные слои модели
+    # head_1
+    head1_pred_in_channels = model.head1.pred_layer.in_channels
+    model.head1.pred_layer = nn.Conv2d(head1_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head1.num_classes = NUM_CLASSES
+    # head_2
+    head2_pred_in_channels = model.head2.pred_layer.in_channels
+    model.head2.pred_layer = nn.Conv2d(head2_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head2.num_classes = NUM_CLASSES
+    # head_3
+    head3_pred_in_channels = model.head3.pred_layer.in_channels
+    model.head3.pred_layer = nn.Conv2d(head3_pred_in_channels, (NUM_CLASSES + 5) * 3, kernel_size=1)
+    model.head3.num_classes = NUM_CLASSES
         
-        if indices.numel() == 1:
-            break
-        
-        # Вычисляем IoU между выбранным боксом и остальными
-        current_box = boxes[index]
-        other_boxes = boxes[indices[1:]]
-        ious = intersection_over_union(current_box, other_boxes)
-        
-        # Удаляем боксы с IoU выше порога
-        indices = indices[1:][ious <= iou_threshold]
+
+    # Перемещаем состояние оптимизатора на нужное устройство
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(DEVICE)
+
+    # If we don't do this then it will just have learning rate of old checkpoint
+    # and it will lead to many hours of debugging \:
+    if NEED_TO_CHANGE_LR:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
     
-    # Возвращаем только выбранные боксы
-    return input[keep]
-
-     
-
-
-if __name__ == "__main__":
-    import os
-    from config import PATH
-    # create loaders
-    os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
-    os.environ['ALBUMENTATIONS_DISABLE_CHECKING_VERSION'] = '1'
-
-
-    train_loader, valid_loader = get_data_loaders(path=PATH, num_images=2)
+    optimizer = Adam([
+            {'params': model.backbone.parameters(), 'lr': LEARNING_RATE * 0.1},  # Lower lr for pretrained layers
+            {'params': model.head1.pred_layer.parameters(), 'lr': LEARNING_RATE},  # Higher lr for new layers
+            {'params': model.head2.pred_layer.parameters(), 'lr': LEARNING_RATE},
+            {'params': model.head3.pred_layer.parameters(), 'lr': LEARNING_RATE}
+        ])
 
     
-    #_______________________________________________________________________________________________
+    return model, optimizer
+    
 
-    from my_yolo_model import YOLO
-    from config import NUM_CLASSES, NUMBER_BLOCKS_LIST, BACKBONE_NUM_CHANNELS
-    # check how to work non max suppression
-    model = YOLO(num_classes=NUM_CLASSES, n_blocks_list=NUMBER_BLOCKS_LIST, backbone_num_channels=BACKBONE_NUM_CHANNELS)
+def load_pretrained_model(checkpoint_path: str, model, optimizer, lr, model_epoch_list):
+    """
+    Если модель загружается из предобученной, то нужно понять является ли модель для coco или pascal
+    """
 
-    model.eval() 
-    for x, y in train_loader:
-        predictions = model(x)       
-        predictions_1, predictions_2, predictions_3 = predictions
-        print(predictions_1.shape)
-        
-        # print(output_1.view(-1, 85).shape)
-        non_max_suppression(predictions_1, confidence_threshold=0.05)
-        
+    checkpoint = torch.load(checkpoint_path)
+    # print("model_dataset_type: ", checkpoint["model_dataset_type"])
+    # print("DATASET_TYPE: ", DATASET_TYPE)
+    # Загрузка предобученной модели
+    # try:
+    # Если тип датасета и тип модели совпадают, то просто загружаем модель
+    if DATASET_TYPE == checkpoint['model_dataset_type']:
+        print(f"=> Загружаем модель из файла {checkpoint_path}")
+        model.load_state_dict(checkpoint["state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        model_epoch_list.append(checkpoint["epoch"])
+        model_dataset_type = checkpoint["model_dataset_type"]
+    # Если тип датасета и тип модели не совпадают, то:
+
+    # Если тип модели - PASCAL_VOC, а тип датасета - COCO, то:
+    elif checkpoint["model_dataset_type"] == 'PASCAL_VOC':
+        model, optimizer = convert_pascal_to_coco_model(checkpoint=checkpoint, model=model, optimizer=optimizer, lr=lr, model_epoch_list=model_epoch_list)
+        print(f"=> Модель загружена из файла {checkpoint_path} обученную на датасете PASCAL_VOC. В модели заменены выходные слои для обучения на датасете COCO")
+    # Если тип модели - COCO, а тип датасета - PASCAL_VOC, то:
+    elif checkpoint["model_dataset_type"] == 'COCO':
+        model, optimizer = convert_coco_to_pascal_model(checkpoint=checkpoint, model=model, optimizer=optimizer, lr=lr, model_epoch_list=model_epoch_list)
+        print(f"=> Модель загружена из файла {checkpoint_path} обученную на датасете COCO. В модели заменены выходные слои для обучения на датасете PASCAL_VOC")
+            
+    # except:
+    #     print("Не удалось загрузить модель")
+
+    return model, optimizer
+
+
+
+def xywh2xyxy(bboxes: torch.Tensor, box_format: str = "midpoint") -> torch.Tensor:
+    """
+    Convert bounding box coordinates from (x, y, w, h) to (x1, y1, x2, y2) format.
+    """
+    if box_format == "midpoint":
+        box_x1 = bboxes[..., 0:1] - bboxes[..., 2:3] / 2
+        box_y1 = bboxes[..., 1:2] - bboxes[..., 3:4] / 2
+        box_x2 = bboxes[..., 0:1] + bboxes[..., 2:3] / 2
+        box_y2 = bboxes[..., 1:2] + bboxes[..., 3:4] / 2
+
+    box_xyxy = torch.cat([box_x1, box_y1, box_x2, box_y2], dim=-1)
+
+    return box_xyxy
+

@@ -2,3 +2,8 @@ OLD/
 __pycache__/
 notebooks/
 venv/
+/test/
+/tests/
+.vscode/
+YOLOv3/
+archive/

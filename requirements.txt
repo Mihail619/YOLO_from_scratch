@@ -4,3 +4,6 @@ pandas
 numpy
 matplotlib
 albumentations
+torchmetrics
+pycocotools
+tqdm
